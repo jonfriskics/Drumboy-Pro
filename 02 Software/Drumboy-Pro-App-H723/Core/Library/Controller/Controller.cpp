@@ -362,6 +362,9 @@ void Controller::update() {
         encoder_read();
         encoder_action();
 
+        // Load or cancel sample audition for the Layer Inst menu.
+        layerInst_updateAudition();
+
         // 3. OUTPUT & UI REFRESH
         // Refresh LED outputs and LCD frame content.
         led_action();
@@ -12677,6 +12680,9 @@ void Controller::preMenuLayerClear() {
     if ((preMenu == LAYER_INST_0_MENU) || (preMenu == LAYER_INST_1_MENU) || (preMenu == LAYER_INST_2_MENU)) {
         uint8_t layerNum = selectedLayerNum;
 
+        // Leaving without loading: drop any auditioned sample and restore the loaded one.
+        if (layerNum < kLayerLibrarySize) layerInst_cancelAudition(layerNum);
+
         // Reset graph cache so next Layer Inst entry redraws waveform/meta from scratch.
         resetLayerInstGraphCache(layerNum);
 
@@ -19448,7 +19454,14 @@ void Controller::layerInst_setSampleSelected(uint8_t layerNum_, int16_t sample_)
         // Close file handle, restore keyboard interrupts, and refresh visible sample fields.
         f_close(&sd.file);
         keyboard_enable();
-        if (((menu == LAYER_INST_0_MENU) || (menu == LAYER_INST_1_MENU) || (menu == LAYER_INST_2_MENU)) && (layerNum_ == selectedLayerNum)) lcd_drawLayerInst_SampleData(layerNum_);
+        if (((menu == LAYER_INST_0_MENU) || (menu == LAYER_INST_1_MENU) || (menu == LAYER_INST_2_MENU)) && (layerNum_ == selectedLayerNum)) {
+            lcd_drawLayerInst_SampleData(layerNum_);
+
+            // 7. AUDITION REQUEST
+            // Browsing in the Layer Inst menu: play the selected sample on this layer
+            // until it is loaded (select) or the menu is left (restores loaded sample).
+            layerInst_requestAudition(layerNum_);
+        }
     }
 }
 
@@ -19463,6 +19476,22 @@ void Controller::layerInst_setSampleLoaded(uint8_t layerNum_) {
     const int16_t prevSampleLoaded = layer.sampleLoaded;
     char prevSampleLoadedFileName[sizeof(layer.sampleLoadedData.fileName)] = {0};
     memcpy(prevSampleLoadedFileName, layer.sampleLoadedData.fileName, sizeof(prevSampleLoadedFileName));
+
+    // 1b. AUDITION HANDOVER
+    // If the selected sample is already auditioning, keep its SDRAM copy as the loaded
+    // sample. Otherwise drop the audition so the load below starts from the loaded state.
+    if ((layer.auditionActive) || (layer.auditionPending) || (layer.auditionSector != -1)) {
+        if (layerInst_commitAudition(layerNum_)) {
+            bool sampleChanged = (prevSampleLoaded != layer.sampleLoaded) || (memcmp(prevSampleLoadedFileName, layer.sampleLoadedData.fileName, sizeof(prevSampleLoadedFileName)) != 0);
+            if (sampleChanged) resetLayerInstGraphCache(layerNum_);
+            if (((menu == LAYER_INST_0_MENU) || (menu == LAYER_INST_1_MENU) || (menu == LAYER_INST_2_MENU)) && (layerNum_ == selectedLayerNum)) {
+                lcd_drawLayerInst_SampleData(layerNum_);
+                lcd_drawLayerInst_GraphData(layerNum_);
+            }
+            return;
+        }
+        layerInst_cancelAudition(layerNum_);
+    }
 
     // 2. LOAD CONDITION VALIDATION
     // Continue only when selected sample is valid and instrument context still matches.
@@ -19491,51 +19520,6 @@ void Controller::layerInst_setSampleLoaded(uint8_t layerNum_) {
             if (HAL_SD_GetState(&hsd2) != HAL_SD_STATE_READY) {
                 HAL_SD_Abort(&hsd2);
             }
-
-            // Static buffer (24KB), not stack-allocated: RAM_D1 has ~80KB of headroom above
-            // the linker's guaranteed heap+stack reservation (8KB heap + 16KB stack), so this
-            // comfortably fits without risking a stack collision during a deep call chain.
-            //
-            // Size is 24576 (6144 x 4): 6144 = 6KB, the original stack-buffer size, chosen
-            // because it divides evenly by every possible offsetSize below (1,2,3,4,6,8,12,16,
-            // 24,32 -- the product of coefSamplerate {1,2,4} * coefChannel {1,2} * coefBps
-            // {1,2,3,4}), so a chunk boundary never lands mid-sample. Any multiple of 6144
-            // inherits that same guarantee, so 4x keeps the property while quadrupling read
-            // throughput.
-            const uint32_t rawArraySize = 24576;
-            static uint8_t rawArray[rawArraySize];
-
-            // Determine Format Coefficients
-            uint32_t sRate = layer.wavLoadedData.fmt_chunk.sampleRate;
-            uint8_t coefSamplerate = (sRate >= 176400) ? 4 : (sRate >= 88200 ? 2 : 1);
-            uint8_t coefChannel = (layer.wavLoadedData.fmt_chunk.nbrChannels == 2) ? 2 : 1;
-            uint8_t coefBps = (layer.wavLoadedData.fmt_chunk.bitPerSample / 8);
-            uint32_t offsetSize = coefSamplerate * coefChannel * coefBps;
-
-            // Determine Upsampling Factor (targeting standard 44.1kHz)
-            uint16_t writeCount = 1;
-            if (sRate < 44100 && sRate > 0) {
-                if (sRate == 8000)
-                    writeCount = 6;
-                else if (sRate == 11025)
-                    writeCount = 4;
-                else if (sRate == 16000)
-                    writeCount = 3;
-                else if (sRate == 22050)
-                    writeCount = 2;
-                else if (sRate == 24000)
-                    writeCount = 2;
-                else
-                    writeCount = (44100 / sRate);
-            }
-
-            // Normalization & Tracking Vars
-            uint32_t sdramDataCounter = 0;
-            float minFloat = 0.0f, maxFloat = 0.0f;
-
-            // Calculate samples per pixel based on final playback size.
-            // Guard against division by zero when sampleSize < 60 (very short samples).
-            const uint32_t samplesPerPixel = (layer.sampleLoadedData.sampleSize >= 60) ? (layer.sampleLoadedData.sampleSize / 60) : 1;
 
             // Step 2: SDRAM Sector Selection Algorithm (Referenced from your code)
             bool sectorAvailable = false;
@@ -19588,80 +19572,10 @@ void Controller::layerInst_setSampleLoaded(uint8_t layerNum_) {
                 sampleSectorLibrary[targetSector].writeMode = true;
                 sampleSectorLibrary[targetSector].normMultiplier = 1.0f;
                 __set_PRIMASK(primaskSector);
-                if ((f_open(&sd.file, layer.sampleLoadedData.fileName, FA_READ) == FR_OK) &&
-                    (f_lseek(&sd.file, layer.wavLoadedData.data_chunk.chunkStartByte + 8) == FR_OK)) {
-                    uint32_t totalBytes = layer.sampleLoadedData.sampleByteSize;
-                    uint32_t bytesReadTotal = 0;
-                    bool sampleReadFailed = false;
-
-                    // Main Polling Loop
-                    while (bytesReadTotal < totalBytes) {
-                        uint32_t toRead = (totalBytes - bytesReadTotal > rawArraySize) ? rawArraySize : (totalBytes - bytesReadTotal);
-
-                        // Hardware Guard: Check status register for errors during the loop
-                        if (hsd2.Instance->STA & (SDMMC_STA_DTIMEOUT | SDMMC_STA_DCRCFAIL)) {
-                            HAL_SD_Abort(&hsd2);
-                            sampleReadFailed = true;
-                            break;
-                        }
-                        if (f_read(&sd.file, rawArray, toRead, &sd.bytesread) == FR_OK) {
-                            if (sd.bytesread == 0) {
-                                // Premature EOF: fewer bytes on disk than the header promised.
-                                sampleReadFailed = true;
-                                break;
-                            }
-                            uint32_t readSamples = sd.bytesread / offsetSize;
-                            for (uint32_t j = 0; j < readSamples; j++) {
-                                float val = 0.0f;
-                                uint32_t idx = j * offsetSize;
-
-                                // Multiformat PCM to Float Conversion
-                                if (layer.wavLoadedData.fmt_chunk.bitPerSample == 8) {
-                                    val = ((float)((uint8_t)rawArray[idx] - 128)) / 128.0f;
-                                } else if (layer.wavLoadedData.fmt_chunk.bitPerSample == 16) {
-                                    int16_t s16 = (int16_t)(rawArray[idx] | (rawArray[idx + 1] << 8));
-                                    val = (float)s16 / 32768.0f;
-                                } else if (layer.wavLoadedData.fmt_chunk.bitPerSample == 24) {
-                                    int32_t s24 = (rawArray[idx] | (rawArray[idx + 1] << 8) | (rawArray[idx + 2] << 16));
-                                    if (s24 & 0x800000) s24 |= 0xFF000000;
-                                    val = (float)s24 / 8388607.0f;
-                                } else if (layer.wavLoadedData.fmt_chunk.bitPerSample == 32) {
-                                    memcpy(&val, &rawArray[idx], 4);
-                                }
-                                if (val < minFloat) minFloat = val;
-                                if (val > maxFloat) maxFloat = val;
-
-                                // Update visual peaks for the 60-bin graph array
-                                uint8_t graphIdx = sdramDataCounter / samplesPerPixel;
-                                if (graphIdx < 60) {
-                                    uint8_t currentPeak = static_cast<uint8_t>(fabsf(val) * 30.0f);
-                                    if (currentPeak > layer.sampleLoadedData.graphData[graphIdx]) {
-                                        layer.sampleLoadedData.graphData[graphIdx] = currentPeak;
-                                    }
-                                }
-
-                                // Sequential Write to SDRAM
-                                uint32_t sdramBase = RAM_SAMPLE_ADDRESS + (layer.writeSampleSector * kSampleByteSize);
-                                for (int k = 0; k < writeCount; k++) {
-                                    if (sdramDataCounter >= kSampleSize)
-                                        break;
-                                    *(volatile float*)(sdramBase + (sdramDataCounter * 4)) = val;
-                                    sdramDataCounter++;
-                                }
-                            }
-                            bytesReadTotal += sd.bytesread;
-                        } else {
-                            sampleReadFailed = true;
-                            break;  // f_read error recovery
-                        }
-                        lcd_drawPlay();
-                    }
-
-                    if (!sampleReadFailed) {
-                        // Finalize Normalization Factor
-                        float peak = (fabsf(minFloat) > fabsf(maxFloat)) ? fabsf(minFloat) : fabsf(maxFloat);
-                        float normValue = 1.0f / (peak < 0.00001f ? 1.0f : peak);
-
+                float normValue = 1.0f;
+                SampleReadResult readResult = layerInst_readSampleToSector(layer.sampleLoadedData, layer.wavLoadedData, targetSector, layer.sampleLoadedData.graphData, normValue);
+                if (readResult != SAMPLE_READ_OPEN_FAIL) {
+                    if (readResult == SAMPLE_READ_OK) {
                         // Switch sector to PlayMode
                         uint32_t primaskPublish = __get_PRIMASK();
                         __disable_irq();
@@ -19766,6 +19680,344 @@ void Controller::layerInst_setSampleLoaded(uint8_t layerNum_) {
         }
         */
     }
+}
+
+SampleReadResult Controller::layerInst_readSampleToSector(const SampleData& sData_, const WavData& wData_, uint8_t sector_, uint8_t* graphData_, float& normOut_) {
+    /// @brief Streams a parsed WAV file from SD into one SDRAM sample sector.
+    /// Converts PCM to float, upsamples to 44.1kHz, fills the 60-bin waveform peaks,
+    /// and reports the normalization multiplier. The caller owns sector bookkeeping
+    /// (active/writeMode/playMode flags) before and after this call.
+
+    normOut_ = 1.0f;
+    memset(graphData_, 0x00, 60);
+
+    // Static buffer (24KB), not stack-allocated: RAM_D1 has ~80KB of headroom above
+    // the linker's guaranteed heap+stack reservation (8KB heap + 16KB stack), so this
+    // comfortably fits without risking a stack collision during a deep call chain.
+    //
+    // Size is 24576 (6144 x 4): 6144 = 6KB, the original stack-buffer size, chosen
+    // because it divides evenly by every possible offsetSize below (1,2,3,4,6,8,12,16,
+    // 24,32 -- the product of coefSamplerate {1,2,4} * coefChannel {1,2} * coefBps
+    // {1,2,3,4}), so a chunk boundary never lands mid-sample. Any multiple of 6144
+    // inherits that same guarantee, so 4x keeps the property while quadrupling read
+    // throughput.
+    const uint32_t rawArraySize = 24576;
+    static uint8_t rawArray[rawArraySize];
+
+    // Determine Format Coefficients
+    uint32_t sRate = wData_.fmt_chunk.sampleRate;
+    uint8_t coefSamplerate = (sRate >= 176400) ? 4 : (sRate >= 88200 ? 2 : 1);
+    uint8_t coefChannel = (wData_.fmt_chunk.nbrChannels == 2) ? 2 : 1;
+    uint8_t coefBps = (wData_.fmt_chunk.bitPerSample / 8);
+    uint32_t offsetSize = coefSamplerate * coefChannel * coefBps;
+
+    // Determine Upsampling Factor (targeting standard 44.1kHz)
+    uint16_t writeCount = 1;
+    if (sRate < 44100 && sRate > 0) {
+        if (sRate == 8000)
+            writeCount = 6;
+        else if (sRate == 11025)
+            writeCount = 4;
+        else if (sRate == 16000)
+            writeCount = 3;
+        else if (sRate == 22050)
+            writeCount = 2;
+        else if (sRate == 24000)
+            writeCount = 2;
+        else
+            writeCount = (44100 / sRate);
+    }
+
+    // Normalization & Tracking Vars
+    uint32_t sdramDataCounter = 0;
+    float minFloat = 0.0f, maxFloat = 0.0f;
+
+    // Calculate samples per pixel based on final playback size.
+    // Guard against division by zero when sampleSize < 60 (very short samples).
+    const uint32_t samplesPerPixel = (sData_.sampleSize >= 60) ? (sData_.sampleSize / 60) : 1;
+
+    // Open File and Sequential Polling Read
+    f_close(&sd.file);
+    if (!((f_open(&sd.file, sData_.fileName, FA_READ) == FR_OK) &&
+          (f_lseek(&sd.file, wData_.data_chunk.chunkStartByte + 8) == FR_OK))) {
+        f_close(&sd.file);
+        return SAMPLE_READ_OPEN_FAIL;
+    }
+    uint32_t totalBytes = sData_.sampleByteSize;
+    uint32_t bytesReadTotal = 0;
+    bool sampleReadFailed = false;
+
+    // Main Polling Loop
+    while (bytesReadTotal < totalBytes) {
+        uint32_t toRead = (totalBytes - bytesReadTotal > rawArraySize) ? rawArraySize : (totalBytes - bytesReadTotal);
+
+        // Hardware Guard: Check status register for errors during the loop
+        if (hsd2.Instance->STA & (SDMMC_STA_DTIMEOUT | SDMMC_STA_DCRCFAIL)) {
+            HAL_SD_Abort(&hsd2);
+            sampleReadFailed = true;
+            break;
+        }
+        if (f_read(&sd.file, rawArray, toRead, &sd.bytesread) == FR_OK) {
+            if (sd.bytesread == 0) {
+                // Premature EOF: fewer bytes on disk than the header promised.
+                sampleReadFailed = true;
+                break;
+            }
+            uint32_t readSamples = sd.bytesread / offsetSize;
+            for (uint32_t j = 0; j < readSamples; j++) {
+                float val = 0.0f;
+                uint32_t idx = j * offsetSize;
+
+                // Multiformat PCM to Float Conversion
+                if (wData_.fmt_chunk.bitPerSample == 8) {
+                    val = ((float)((uint8_t)rawArray[idx] - 128)) / 128.0f;
+                } else if (wData_.fmt_chunk.bitPerSample == 16) {
+                    int16_t s16 = (int16_t)(rawArray[idx] | (rawArray[idx + 1] << 8));
+                    val = (float)s16 / 32768.0f;
+                } else if (wData_.fmt_chunk.bitPerSample == 24) {
+                    int32_t s24 = (rawArray[idx] | (rawArray[idx + 1] << 8) | (rawArray[idx + 2] << 16));
+                    if (s24 & 0x800000) s24 |= 0xFF000000;
+                    val = (float)s24 / 8388607.0f;
+                } else if (wData_.fmt_chunk.bitPerSample == 32) {
+                    memcpy(&val, &rawArray[idx], 4);
+                }
+                if (val < minFloat) minFloat = val;
+                if (val > maxFloat) maxFloat = val;
+
+                // Update visual peaks for the 60-bin graph array
+                uint8_t graphIdx = sdramDataCounter / samplesPerPixel;
+                if (graphIdx < 60) {
+                    uint8_t currentPeak = static_cast<uint8_t>(fabsf(val) * 30.0f);
+                    if (currentPeak > graphData_[graphIdx]) {
+                        graphData_[graphIdx] = currentPeak;
+                    }
+                }
+
+                // Sequential Write to SDRAM
+                uint32_t sdramBase = RAM_SAMPLE_ADDRESS + (sector_ * kSampleByteSize);
+                for (int k = 0; k < writeCount; k++) {
+                    if (sdramDataCounter >= kSampleSize)
+                        break;
+                    *(volatile float*)(sdramBase + (sdramDataCounter * 4)) = val;
+                    sdramDataCounter++;
+                }
+            }
+            bytesReadTotal += sd.bytesread;
+        } else {
+            sampleReadFailed = true;
+            break;  // f_read error recovery
+        }
+        lcd_drawPlay();
+    }
+    f_close(&sd.file);
+    if (sampleReadFailed) return SAMPLE_READ_FAIL;
+
+    // Finalize Normalization Factor
+    float peak = (fabsf(minFloat) > fabsf(maxFloat)) ? fabsf(minFloat) : fabsf(maxFloat);
+    normOut_ = 1.0f / (peak < 0.00001f ? 1.0f : peak);
+    return SAMPLE_READ_OK;
+}
+
+void Controller::layerInst_requestAudition(uint8_t layerNum_) {
+    /// @brief Schedules an audition load for the layer's selected sample.
+    /// The load itself runs from update() once the encoder has been idle for
+    /// kAuditionDelayMs, so scrolling quickly through samples does not block on
+    /// an SD read at every detent.
+
+    Layer& layer = layerLibrary[layerNum_];
+    layer.auditionPending = true;
+    layer.auditionRequestTick = HAL_GetTick();
+}
+
+void Controller::layerInst_updateAudition() {
+    /// @brief Main-loop service for sample audition.
+    /// Cancels audition when its layer is no longer open in the Layer Inst menu, and
+    /// runs a pending audition load after the debounce interval.
+
+    bool layerInstMenu = (menu == LAYER_INST_0_MENU) || (menu == LAYER_INST_1_MENU) || (menu == LAYER_INST_2_MENU);
+    for (uint8_t i = 0; i < kLayerLibrarySize; i++) {
+        Layer& layer = layerLibrary[i];
+        if ((!layer.auditionPending) && (!layer.auditionActive) && (layer.auditionSector == -1)) continue;
+
+        if ((!layerInstMenu) || (selectedLayerNum != i)) {
+            // Left the menu (or switched layer) without loading: restore the loaded sound.
+            layerInst_cancelAudition(i);
+        } else if ((layer.auditionPending) && ((HAL_GetTick() - layer.auditionRequestTick) >= kAuditionDelayMs)) {
+            layer.auditionPending = false;
+            layerInst_loadAudition(i);
+        }
+    }
+}
+
+void Controller::layerInst_loadAudition(uint8_t layerNum_) {
+    /// @brief Loads the selected (not yet committed) sample into a spare SDRAM sector
+    /// and makes it the layer's play sector, so a running pattern plays the new sound.
+    /// The loaded sample's sector is never written, so cancel can restore it instantly.
+
+    Layer& layer = layerLibrary[layerNum_];
+    if (layer.sampleLoading) return;
+
+    // 1. SELECTION CHECK
+    // Back on the loaded sample, or nothing playable selected: play the loaded sound.
+    bool selectionIsLoaded = (strcmp(layer.instSelectedData.fileName, layer.instLoadedData.fileName) == 0) && (strcmp(layer.sampleSelectedData.fileName, layer.sampleLoadedData.fileName) == 0);
+    if ((selectionIsLoaded) || (layer.sampleSelected == -1) || (layer.sampleSelectedReadError) || (layer.sampleSelectedTypeError) || (layer.sampleSelectedData.sampleSize == 0)) {
+        layerInst_cancelAudition(layerNum_);
+        return;
+    }
+
+    // Already auditioning this exact file.
+    if ((layer.auditionActive) && (strcmp(layer.auditionFileName, layer.sampleSelectedData.fileName) == 0)) return;
+
+    // 2. SECTOR SELECTION
+    // Prefer a free sector; otherwise rewrite the current audition sector. Never touch
+    // the loaded sample's sector. Without spare SDRAM, keep playing the current sound.
+    int8_t targetSector = -1;
+    for (uint8_t i = 0; i < kSampleSectorLibrarySize; i++) {
+        if (!sampleSectorLibrary[i].active) {
+            targetSector = i;
+            break;
+        }
+    }
+    if ((targetSector == -1) && (layer.auditionSector != -1)) targetSector = layer.auditionSector;
+    if (targetSector == -1) return;
+
+    if (HAL_SD_GetState(&hsd2) != HAL_SD_STATE_READY) {
+        HAL_SD_Abort(&hsd2);
+    }
+
+    // 3. SECTOR PREPARATION
+    uint32_t primaskPrepare = __get_PRIMASK();
+    __disable_irq();
+    if ((!layer.auditionActive) && (layer.auditionSector == -1)) {
+        // First audition since the menu was opened: remember what to restore.
+        layer.auditionOrigSector = layer.playSampleSector;
+        layer.auditionOrigSamplePlay = layer.samplePlay;
+    }
+    if (targetSector == layer.auditionSector) {
+        // Rewriting the audition sector in place: play the loaded sound meanwhile.
+        layer.playSampleSector = layer.auditionOrigSector;
+        layer.samplePlay = layer.auditionOrigSamplePlay;
+        layer.auditionActive = false;
+    }
+    // Stop every in-flight beat reading this sector before writeMode goes up.
+    uint32_t targetSectorAddress = RAM_SAMPLE_ADDRESS + (targetSector * kSampleByteSize);
+    for (uint8_t i = 0; i < kLayerLibrarySize; i++) {
+        BeatPlayData& sectorABD = layerPlayData[i].activeBeatPlayData;
+        BeatPlayData& sectorTBD = layerPlayData[i].tempBeatPlayData;
+        if (sectorABD.active && sectorABD.ramAddress == targetSectorAddress) {
+            sectorABD.active = false;
+            sectorABD.counter = 0;
+        }
+        if (sectorTBD.active && sectorTBD.ramAddress == targetSectorAddress) {
+            sectorTBD.active = false;
+            sectorTBD.counter = 0;
+        }
+    }
+    sampleSectorLibrary[targetSector].active = true;
+    sampleSectorLibrary[targetSector].layer = layer.number;
+    sampleSectorLibrary[targetSector].size = layer.sampleSelectedData.sampleSize - 1;
+    sampleSectorLibrary[targetSector].playMode = false;
+    sampleSectorLibrary[targetSector].writeMode = true;
+    sampleSectorLibrary[targetSector].normMultiplier = 1.0f;
+    __set_PRIMASK(primaskPrepare);
+
+    // 4. SD -> SDRAM TRANSFER
+    // The loaded (or previous audition) sound keeps playing during the read.
+    keyboard_disable();
+    float normValue = 1.0f;
+    uint8_t graphData[60];
+    SampleReadResult readResult = layerInst_readSampleToSector(layer.sampleSelectedData, layer.wavSelectedData, targetSector, graphData, normValue);
+    keyboard_enable();
+
+    // 5. PUBLISH OR RELEASE
+    if (readResult == SAMPLE_READ_OK) {
+        uint32_t primaskPublish = __get_PRIMASK();
+        __disable_irq();
+        sampleSectorLibrary[targetSector].normMultiplier = normValue;
+        __DMB();
+        sampleSectorLibrary[targetSector].playMode = true;
+        sampleSectorLibrary[targetSector].writeMode = false;
+        int8_t prevAuditionSector = layer.auditionSector;
+        layer.playSampleSector = targetSector;
+        layer.samplePlay = true;
+        if ((prevAuditionSector != -1) && (prevAuditionSector != targetSector)) layerInst_clearSampleSector(prevAuditionSector);
+        layer.auditionSector = targetSector;
+        layer.auditionActive = true;
+        __set_PRIMASK(primaskPublish);
+        strncpy(layer.auditionFileName, layer.sampleSelectedData.fileName, sizeof(layer.auditionFileName) - 1);
+        layer.auditionFileName[sizeof(layer.auditionFileName) - 1] = '\0';
+        memcpy(layer.auditionGraphData, graphData, sizeof(layer.auditionGraphData));
+    } else {
+        uint32_t primaskRelease = __get_PRIMASK();
+        __disable_irq();
+        layerInst_clearSampleSector(targetSector);
+        if (layer.auditionSector == targetSector) layer.auditionSector = -1;
+        __set_PRIMASK(primaskRelease);
+        // Fall back to the loaded sound rather than a stale audition of another sample.
+        layerInst_cancelAudition(layerNum_);
+    }
+}
+
+void Controller::layerInst_cancelAudition(uint8_t layerNum_) {
+    /// @brief Ends audition and restores the loaded sample as the layer's play sector.
+    /// In-flight hits of the auditioned sample are left to ring out; the sector's SDRAM
+    /// data stays intact until a later load overwrites it (which stops such hits first).
+
+    Layer& layer = layerLibrary[layerNum_];
+    layer.auditionPending = false;
+    if ((layer.auditionActive) || (layer.auditionSector != -1)) {
+        uint32_t primaskCancel = __get_PRIMASK();
+        __disable_irq();
+        if (layer.auditionActive) {
+            layer.playSampleSector = layer.auditionOrigSector;
+            layer.samplePlay = layer.auditionOrigSamplePlay;
+        }
+        if (layer.auditionSector != -1) layerInst_clearSampleSector(layer.auditionSector);
+        layer.auditionActive = false;
+        layer.auditionSector = -1;
+        layer.auditionOrigSector = -1;
+        layer.auditionOrigSamplePlay = false;
+        __set_PRIMASK(primaskCancel);
+    }
+    layer.auditionFileName[0] = '\0';
+}
+
+bool Controller::layerInst_commitAudition(uint8_t layerNum_) {
+    /// @brief Promotes the auditioned sample to the loaded sample without re-reading SD.
+    /// Returns false when the audition does not match the current selection.
+
+    Layer& layer = layerLibrary[layerNum_];
+    if (!((layer.auditionActive) && (layer.auditionSector != -1) && (layer.sampleSelected != -1) && (!layer.sampleSelectedReadError) && (!layer.sampleSelectedTypeError) && (layer.instSelected == layer.instLoaded) && (strcmp(layer.auditionFileName, layer.sampleSelectedData.fileName) == 0))) {
+        return false;
+    }
+
+    // 1. LOADED METADATA UPDATE
+    layer.sampleLoaded = layer.sampleSelected;
+    layer.sampleLoadedData = layer.sampleSelectedData;
+    layer.wavLoadedData = layer.wavSelectedData;
+    memcpy(layer.sampleLoadedData.graphData, layer.auditionGraphData, sizeof(layer.sampleLoadedData.graphData));
+    layer.sampleLoadedData.timeData = static_cast<float>(layer.sampleLoadedData.sampleSize) / AUDIO_SAMPLE_RATE;
+
+    // 2. SECTOR HANDOVER
+    // Audition sector becomes the layer's sector; release the previously loaded one.
+    uint32_t primaskCommit = __get_PRIMASK();
+    __disable_irq();
+    layer.playSampleSector = layer.auditionSector;
+    layer.writeSampleSector = layer.auditionSector;
+    layer.samplePlay = true;
+    for (uint8_t s = 0; s < kSampleSectorLibrarySize; s++) {
+        if (sampleSectorLibrary[s].active && sampleSectorLibrary[s].layer == layer.number && s != layer.playSampleSector) {
+            layerInst_clearSampleSector(s);
+        }
+    }
+    layer.auditionPending = false;
+    layer.auditionActive = false;
+    layer.auditionSector = -1;
+    layer.auditionOrigSector = -1;
+    layer.auditionOrigSamplePlay = false;
+    __set_PRIMASK(primaskCommit);
+    layer.auditionFileName[0] = '\0';
+    return true;
 }
 
 void Controller::layerInst_clearSampleSector(uint8_t sectorNum_) {

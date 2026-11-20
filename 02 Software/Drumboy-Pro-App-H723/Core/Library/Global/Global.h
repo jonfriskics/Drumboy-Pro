@@ -339,6 +339,14 @@ const uint32_t kSampleByteSize                      = kSampleSize * 4;
 
 const uint8_t kSampleSectorLibrarySize              = 15;
 
+const uint32_t kAuditionDelayMs                     = 250;                      // Encoder idle time before an audition load starts
+
+enum SampleReadResult {
+    SAMPLE_READ_OK,
+    SAMPLE_READ_OPEN_FAIL,
+    SAMPLE_READ_FAIL
+};
+
 struct SampleSector {
     bool active = false;
     uint8_t layer = 0;
@@ -7188,6 +7196,18 @@ struct Layer {
 
     bool samplePlay                                 = false;
     volatile bool sampleLoading                     = false;
+
+    // Audition state: while browsing samples in the Layer Inst menu, the selected
+    // sample is loaded into a spare SDRAM sector and played in place of the loaded
+    // one. The loaded sample's sector is kept intact so it can be restored on cancel.
+    bool auditionPending                            = false;    // Selection changed, load scheduled after debounce
+    uint32_t auditionRequestTick                    = 0;        // HAL tick of the last selection change
+    bool auditionActive                             = false;    // Audition sector is currently the play sector
+    int8_t auditionSector                           = -1;       // SDRAM sector holding the auditioned sample
+    int8_t auditionOrigSector                       = -1;       // Play sector to restore on cancel
+    bool auditionOrigSamplePlay                     = false;    // samplePlay value to restore on cancel
+    char auditionFileName[(kFileNameSize * 2) + 10] = "";       // File currently held in auditionSector
+    uint8_t auditionGraphData[60]                   = {};       // Waveform peaks of the auditioned sample
 
     Layer(uint8_t number_) : number(number_) {}
     ~Layer() {}
