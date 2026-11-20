@@ -941,6 +941,12 @@ class Controller {
     void layerInst_setSampleSelected(uint8_t layerNum_, int16_t sample_);
     void layerInst_setSampleLoaded(uint8_t layerNum_);
     void layerInst_clearSampleSector(uint8_t sectorNum_);
+    SampleReadResult layerInst_readSampleToSector(const SampleData& sData_, const WavData& wData_, uint8_t sector_, uint8_t* graphData_, float& normOut_);
+    void layerInst_requestAudition(uint8_t layerNum_);
+    void layerInst_updateAudition();
+    void layerInst_loadAudition(uint8_t layerNum_);
+    void layerInst_cancelAudition(uint8_t layerNum_);
+    bool layerInst_commitAudition(uint8_t layerNum_);
 
     void layerInst_setLevel(uint8_t layerNum_, uint8_t level_);
     void layerInst_setPitch(uint8_t layerNum_, uint8_t pitch_);
